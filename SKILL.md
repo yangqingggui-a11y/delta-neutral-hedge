@@ -108,7 +108,7 @@ Delta-Neutral 对冲策略 V1.2
 - side = buy
 - posSide = long
 - ordType = limit
-- px = bid1
+- px = mid - 5（低于中间价$5，确保 maker）
 - sz = 70（保证金 $70）
 - tgtCcy = margin（系统自动按杠杆计算张数：$70 × 20 = $1400 名义）
 - tpTriggerPx = tp_long
@@ -123,7 +123,7 @@ Delta-Neutral 对冲策略 V1.2
 - side = sell
 - posSide = short
 - ordType = limit
-- px = ask1
+- px = mid + 5（高于中间价$5，确保 maker）
 - sz = 70（保证金 $70）
 - tgtCcy = margin
 - tpTriggerPx = tp_short
@@ -131,9 +131,8 @@ Delta-Neutral 对冲策略 V1.2
 - slTriggerPx = sl_short
 - slOrdPx = sl_short（限价）
 
-注意：如果 limit 单立即成交了也没关系（VIP9 在 bid1/ask1 大概率 maker）。
-如果需要确保 maker，改用 ordType=post_only，但空头侧可能被拒（盘口过紧时），
-被拒后用 px=ask1+1.0 重试。
+说明：多空各偏移中间价$5，总敞口$10（占$72K仅0.014%，可忽略）。
+使用 limit 而非 post_only，避免盘口过紧时空头侧被拒。
 
 ## 3.4 等待成交
 
