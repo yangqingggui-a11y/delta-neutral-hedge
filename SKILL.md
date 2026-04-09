@@ -48,8 +48,8 @@ qty = floor(1400 / (mid_price × 0.01))
 - instId = BTC-USDT-SWAP
 - side = buy
 - posSide = long
-- ordType = limit
-- px = bid1（盘口最优买价，确保 maker）
+- ordType = post_only（确保 maker）
+- px = bid1（盘口最优买价）
 - sz = qty
 - tag = "agentTradeKit"
 
@@ -57,10 +57,11 @@ qty = floor(1400 / (mid_price × 0.01))
 - instId = BTC-USDT-SWAP
 - side = sell
 - posSide = short
-- ordType = limit
-- px = ask1（盘口最优卖价，确保 maker）
+- ordType = post_only（确保 maker）
+- px = ask1 + 0.1（比卖一价高0.1，避免post_only被拒）
 - sz = qty
 - tag = "agentTradeKit"
+- 注意：如果 post_only 被拒（cancelSource=31），改用 ask1 + 1.0 重试
 
 ## 3.4 等待成交
 
@@ -80,46 +81,54 @@ qty = floor(1400 / (mid_price × 0.01))
 - tp_short = mid × 0.998（空头止盈 -0.20%）
 - sl_short = mid × 1.005（空头止损 +0.50%）
 
-# Step 4 · 持仓监控与平仓
+# Step 4 · 挂 TP/SL 委托单（OCO限价）
 
-每 2 秒调用 market_get_ticker 获取最新价格，判断是否触发止盈或止损。
+开仓成交后，立即调用 swap_place_algo_order 为两侧挂 OCO 止盈止损单。
+OCO 单特性：TP 先触发则自动取消 SL，反之亦然。
 
-## 多头判断
-- 如果 last >= tp_long → 平多头
-- 如果 last <= sl_long → 平多头
+## 多头 TP/SL
 
-## 空头判断
-- 如果 last <= tp_short → 平空头
-- 如果 last >= sl_short → 平空头
-
-## 平仓执行
-
-平多头时调用 swap_place_order：
+调用 swap_place_algo_order：
 - instId = BTC-USDT-SWAP
-- side = sell
+- tdMode = isolated
+- side = sell（平多头）
 - posSide = long
-- ordType = limit
-- px = ask1（挂卖一价，maker）
+- ordType = oco
 - sz = 持仓张数
-- tag = "agentTradeKit"
+- tpTriggerPx = tp_long（开仓价 × 1.002）
+- tpOrdPx = tp_long（限价，确保 maker）
+- slTriggerPx = sl_long（开仓价 × 0.995）
+- slOrdPx = sl_long（限价）
+- reduceOnly = true
 
-平空头时调用 swap_place_order：
+## 空头 TP/SL
+
+调用 swap_place_algo_order：
 - instId = BTC-USDT-SWAP
-- side = buy
+- tdMode = isolated
+- side = buy（平空头）
 - posSide = short
-- ordType = limit
-- px = bid1（挂买一价，maker）
+- ordType = oco
 - sz = 持仓张数
-- tag = "agentTradeKit"
+- tpTriggerPx = tp_short（开仓价 × 0.998）
+- tpOrdPx = tp_short（限价，确保 maker）
+- slTriggerPx = sl_short（开仓价 × 1.005）
+- slOrdPx = sl_short（限价）
+- reduceOnly = true
 
-## 两侧都平仓后
+## 持仓监控
 
-记录本轮结果：
+OCO 单由交易所自动监控和执行，不需要轮询价格。
+每 10 分钟检查一次持仓状态（account_get_positions）：
+- 两侧都还在 → 继续等待
+- 一侧已平（OCO触发）→ 等待另一侧 OCO 触发
+- 两侧都平 → 记录结果，等待 5 秒冷却，回到 Step 1
+
+## 结果记录
+
 - DOUBLE_TP（双边止盈）：最优结果，两边都赚
-- LONG_TP_SHORT_SL：多头止盈+空头止损
-- SHORT_TP_LONG_SL：空头止盈+多头止损
-
-等待 5 秒冷却，回到 Step 1 开始下一轮。
+- LONG_TP_SHORT_SL：多头止盈 + 空头止损
+- SHORT_TP_LONG_SL：空头止盈 + 多头止损
 
 # Step 5 · AI 综合判断（核心）
 
