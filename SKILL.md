@@ -1,5 +1,5 @@
 # 策略名称
-Delta-Neutral 对冲策略 V1.1
+Delta-Neutral 对冲策略 V1.2
 
 # 执行节奏
 每 10 分钟触发一次
@@ -15,8 +15,8 @@ Delta-Neutral 对冲策略 V1.1
   "status": "open|partial|closed",
   "open_time": "2026-04-09T18:26:00Z",
   "close_time": "",
-  "long": {"ordId": "", "avgPx": 0, "sz": 2, "algoId": "", "state": "open|tp|sl|orphan"},
-  "short": {"ordId": "", "avgPx": 0, "sz": 2, "algoId": "", "state": "open|tp|sl|orphan"},
+  "long": {"ordId": "", "avgPx": 0, "sz": 0, "algoId": "", "state": "open|tp|sl|orphan"},
+  "short": {"ordId": "", "avgPx": 0, "sz": 0, "algoId": "", "state": "open|tp|sl|orphan"},
   "result": "",
   "pnl": 0
 }
@@ -28,93 +28,122 @@ Delta-Neutral 对冲策略 V1.1
 
 调用 market_get_ticker 获取 BTC-USDT-SWAP 最新价格。
 调用 market_get_orderbook 获取 BTC-USDT-SWAP 盘口深度（depth=1），取 bid1 和 ask1。
-调用 market_get_candles 获取 BTC-USDT-SWAP 的 1m K线，计算最近 60 根的波动率（ATR）。
+调用 market_get_candles 获取 BTC-USDT-SWAP 的 1m K线（limit=60），计算 ATR(14)。
 
-# Step 2 · 账户状态检查
+# Step 2 · 账户与持仓检查
 
-调用 account_get_balance 获取 USDT 可用余额。
-调用 account_get_positions 获取当前 BTC-USDT-SWAP 持仓。
+并行调用：
+- account_get_balance（ccy=USDT）获取可用余额
+- swap_get_positions（instId=BTC-USDT-SWAP）获取持仓
+- swap_get_algo_orders（instId=BTC-USDT-SWAP, ordType=oco, status=pending）获取活跃 OCO 单
+- swap_get_orders（instId=BTC-USDT-SWAP）获取活跃挂单
 
-同时调用 swap_get_algo_orders 获取当前挂着的 OCO/conditional 委托单。
+仅关注 mgnMode=isolated 且 pos > 0 的持仓，忽略 cross 模式的空仓位。
 
-## 2.1 正常状态判断
+## 2.1 状态判断
 
-1. 如果 long pos > 0 且 short pos > 0 → 对冲完整，跳到 Step 4（监控阶段）
-2. 如果 long pos = 0 且 short pos = 0 且无挂单 → 空仓，跳到 Step 3（开仓）
-3. 如果可用余额 < 140 USDT → 本次跳过，等待下一轮
+| 多头持仓 | 空头持仓 | 状态 | 动作 |
+|---------|---------|------|------|
+| pos > 0 | pos > 0 | 对冲完整 | → Step 4 监控 |
+| pos = 0 | pos = 0 | 空仓 | → Step 3 开仓 |
+| pos > 0 | pos = 0 | 孤儿单 | → Step 2.2 |
+| pos = 0 | pos > 0 | 孤儿单 | → Step 2.2 |
 
-## 2.2 异常状态：孤儿单处理
+余额检查：可用余额 < 140 USDT → 跳过本轮
 
-如果只有单侧持仓（long > 0 但 short = 0，或反之）：
+## 2.2 孤儿单处理
 
-1. 读取 hedge_log.json，找到最后一条 status="open" 或 "partial" 的记录
-2. 用记录中的 ordId 和 avgPx 与当前持仓对比：
-   - 如果当前持仓的 avgPx 匹配记录 → 这是对冲的一侧，另一侧已被 OCO 平仓
-     → 检查对应的 algoId 是否还活着（swap_get_algo_orders）
-     → 如果 algo 还在 → 正常等待，另一侧会被 OCO 自动平
-     → 如果 algo 已触发/取消 → 标记为 "partial"，用限价单平掉剩余侧
-   - 如果当前持仓的 avgPx 不匹配任何记录 → 未知敞口（可能是手动开的或其他策略）
-     → 不操作，跳过本轮，记录警告日志
+读取 hedge_log.json 最后一条 status="open" 或 "partial" 的记录：
 
-3. 如果存在未成交的挂单（swap_get_orders state=live）但无对应持仓：
-   - 匹配 hedge_log 中的 ordId → 上一轮开仓未完成，撤单
-   - 不匹配任何记录 → 未知挂单，不操作，记录警告
+1. 当前持仓的 avgPx 匹配记录中某侧 → 对冲的一侧已被 OCO 平仓
+   - 检查剩余侧的 algoId 是否还在（swap_get_algo_orders pending）
+   - algo 还在 → 正常等待，OCO 会自动平
+   - algo 不在 → 为剩余侧重新挂 OCO（Step 4 逻辑）
+   - 更新 hedge_log status="partial"
 
-## 2.3 状态同步
+2. 当前持仓不匹配任何记录 → 未知敞口
+   - 不操作，记录警告，跳过本轮
 
-每次检查后更新 hedge_log.json：
-- 如果两侧都平了，将最后一条记录 status 改为 "closed"，记录 result 和 pnl
-- 如果一侧平了，标记 status="partial"，记录哪侧已平
+3. 有活跃挂单但无持仓 → 上一轮开仓未完成
+   - 匹配 hedge_log 中的 ordId → 撤单（swap_cancel_order）
+   - 不匹配 → 未知挂单，不操作，记录警告
 
-# Step 3 · 开仓执行（仅当无持仓时）
+# Step 3 · 开仓（仅当空仓时）
 
-## 3.1 设置杠杆
+## 3.1 AI 判断（开仓前必须执行）
 
-调用 account_set_leverage：
+1. ATR 检查：
+   - ATR < 价格 × 0.05% → 波动不足，跳过
+   - ATR > 价格 × 0.5% → 波动过大，保证金减半（$35/侧）
+   - 正常 → $70/侧
+
+2. 盘口价差：
+   - spread = (ask1 - bid1) / mid > 0.05% → 跳过
+   - spread ≤ 0.05% → 正常
+
+3. 最近 5 轮结果（读 hedge_log）：
+   - 连续 5 轮无 DTP → 暂停 30 分钟
+   - DTP 率 > 40% → 正常
+
+综合判断：开仓 / 减仓 / 跳过，记录理由。
+
+## 3.2 设置杠杆
+
+调用 swap_set_leverage（两次）：
+- instId=BTC-USDT-SWAP, lever=20, mgnMode=isolated, posSide=long
+- instId=BTC-USDT-SWAP, lever=20, mgnMode=isolated, posSide=short
+
+## 3.3 开仓（使用 tgtCcy=margin 按保证金下单）
+
+计算 TP/SL 价格（基于 mid = (bid1+ask1)/2）：
+- tp_long = mid × 1.002
+- sl_long = mid × 0.995
+- tp_short = mid × 0.998
+- sl_short = mid × 1.005
+
+开多头（附带 TP/SL，一步到位）：
+调用 swap_place_order：
 - instId = BTC-USDT-SWAP
-- lever = 20
-- mgnMode = isolated
-- posSide = long
-
-再次调用 account_set_leverage：
-- instId = BTC-USDT-SWAP
-- lever = 20
-- mgnMode = isolated
-- posSide = short
-
-## 3.2 计算张数
-
-notional = 70 × 20 = 1400 USDT
-qty = floor(1400 / (mid_price × 0.01))
-最小 qty = 1
-
-## 3.3 双向同时开仓
-
-调用 swap_place_order 开多：
-- instId = BTC-USDT-SWAP
+- tdMode = isolated
 - side = buy
 - posSide = long
-- ordType = post_only（确保 maker）
-- px = bid1（盘口最优买价）
-- sz = qty
-- tag = "agentTradeKit"
+- ordType = limit
+- px = bid1
+- sz = 70（保证金 $70）
+- tgtCcy = margin（系统自动按杠杆计算张数：$70 × 20 = $1400 名义）
+- tpTriggerPx = tp_long
+- tpOrdPx = tp_long（限价 maker）
+- slTriggerPx = sl_long
+- slOrdPx = sl_long（限价）
 
-调用 swap_place_order 开空：
+开空头（附带 TP/SL）：
+调用 swap_place_order：
 - instId = BTC-USDT-SWAP
+- tdMode = isolated
 - side = sell
 - posSide = short
-- ordType = post_only（确保 maker）
-- px = ask1 + 0.1（比卖一价高0.1，避免post_only被拒）
-- sz = qty
-- tag = "agentTradeKit"
-- 注意：如果 post_only 被拒（cancelSource=31），改用 ask1 + 1.0 重试
+- ordType = limit
+- px = ask1
+- sz = 70（保证金 $70）
+- tgtCcy = margin
+- tpTriggerPx = tp_short
+- tpOrdPx = tp_short（限价 maker）
+- slTriggerPx = sl_short
+- slOrdPx = sl_short（限价）
+
+注意：如果 limit 单立即成交了也没关系（VIP9 在 bid1/ask1 大概率 maker）。
+如果需要确保 maker，改用 ordType=post_only，但空头侧可能被拒（盘口过紧时），
+被拒后用 px=ask1+1.0 重试。
 
 ## 3.4 等待成交
 
-每 5 秒检查一次订单状态（调用 swap_get_order）。
-超时 120 秒仍未双侧成交 → 撤销未成交侧（swap_cancel_order），平掉已成交侧。
+每 5 秒检查订单状态（swap_get_order）。
+超时 120 秒未双侧成交：
+- 撤销未成交侧（swap_cancel_order）
+- 已成交侧用 swap_close 市价平仓（紧急平仓命令）
+- 等待下一轮
 
-## 3.5 记录开仓并计算 TP/SL
+## 3.5 写入交易记录
 
 双侧成交后，写入 hedge_log.json：
 ```json
@@ -122,108 +151,72 @@ qty = floor(1400 / (mid_price × 0.01))
   "cycle": <上一轮cycle+1>,
   "status": "open",
   "open_time": "<当前UTC时间>",
-  "long": {"ordId": "<多头订单号>", "avgPx": <多头成交价>, "sz": <张数>, "algoId": "", "state": "open"},
-  "short": {"ordId": "<空头订单号>", "avgPx": <空头成交价>, "sz": <张数>, "algoId": "", "state": "open"},
+  "long": {"ordId": "<多头ordId>", "avgPx": <成交价>, "sz": <张数>, "algoId": "<附带的algoId>", "state": "open"},
+  "short": {"ordId": "<空头ordId>", "avgPx": <成交价>, "sz": <张数>, "algoId": "<附带的algoId>", "state": "open"},
   "result": "",
   "pnl": 0
 }
 ```
 
-计算止盈止损价（基于各自成交价）：
-- tp_long = long.avgPx × 1.002（多头止盈 +0.20%）
-- sl_long = long.avgPx × 0.995（多头止损 -0.50%）
-- tp_short = short.avgPx × 0.998（空头止盈 -0.20%）
-- sl_short = short.avgPx × 1.005（空头止损 +0.50%）
+# Step 4 · 持仓监控与自动循环
 
-# Step 4 · 挂 TP/SL 委托单（OCO限价）
+TP/SL 由开仓时附带的条件单在交易所侧静默执行，我们无法实时感知触发事件。
+每 10 分钟通过检查持仓状态来发现结果。
 
-开仓成交后，立即调用 swap_place_algo_order 为两侧挂 OCO 止盈止损单。
-OCO 单特性：TP 先触发则自动取消 SL，反之亦然。
+## 4.1 检查流程
 
-## 多头 TP/SL
+调用 swap_get_positions（instId=BTC-USDT-SWAP），只看 isolated 且 pos > 0 的仓位：
 
-调用 swap_place_algo_order：
+| 多头 pos | 空头 pos | 含义 | 动作 |
+|---------|---------|------|------|
+| > 0 | > 0 | 两侧都在，还没触发 | 等待，检查条件单是否还在（4.2） |
+| 0 | 0 | **两侧都已平 → 本轮结束** | 判断结果（4.3），开新一轮（回 Step 1） |
+| > 0 | 0 | 空头已被平（TP 或 SL 触发） | 等待多头 OCO 触发 |
+| 0 | > 0 | 多头已被平（TP 或 SL 触发） | 等待空头 OCO 触发 |
+
+## 4.2 条件单健康检查
+
+如果仍有持仓，检查对应的条件单是否还活着：
+调用 swap_get_algo_orders（status=pending, instId=BTC-USDT-SWAP）
+
+- 条件单在 → 正常等待
+- 条件单消失但持仓还在 → 异常，根据 hedge_log 中的 avgPx 重新计算 TP/SL，补挂 OCO：
+  调用 swap_place_algo_order（ordType=oco, reduceOnly=true, 限价）
+
+## 4.3 本轮结束判定
+
+当两侧都平仓后（pos=0 且 pos=0），本轮结束。
+
+结果只有两种：
+- **DOUBLE_TP**：价格先往一个方向走触发一侧 TP，再回调触发另一侧 TP
+- **TP+SL**：价格单边走，一侧 TP 另一侧 SL
+
+通过 swap_get_algo_orders(status=history) 查询两个 algoId 的触发结果确认。
+
+## 4.4 记录并开新轮
+
+1. 调用 account_get_positions_history 获取 realizedPnl、fee、rebate
+2. 更新 hedge_log.json：status="closed"，记录 result 和 pnl
+3. 检查是否满足开新仓条件：
+   - 可用余额 >= $140 → 回到 Step 1 开新一轮
+   - 当日累计亏损 > $50 → 停止至次日
+   - 连续 5 轮无 DTP → 暂停 30 分钟
+4. 满足条件 → 立即回到 Step 1，不需要等下一个 10 分钟周期
+
+# 紧急操作
+
+如遇异常需要立刻清仓：
+调用 swap_close：
 - instId = BTC-USDT-SWAP
-- tdMode = isolated
-- side = sell（平多头）
-- posSide = long
-- ordType = oco
-- sz = 持仓张数
-- tpTriggerPx = tp_long（开仓价 × 1.002）
-- tpOrdPx = tp_long（限价，确保 maker）
-- slTriggerPx = sl_long（开仓价 × 0.995）
-- slOrdPx = sl_long（限价）
-- reduceOnly = true
-
-## 空头 TP/SL
-
-调用 swap_place_algo_order：
-- instId = BTC-USDT-SWAP
-- tdMode = isolated
-- side = buy（平空头）
-- posSide = short
-- ordType = oco
-- sz = 持仓张数
-- tpTriggerPx = tp_short（开仓价 × 0.998）
-- tpOrdPx = tp_short（限价，确保 maker）
-- slTriggerPx = sl_short（开仓价 × 1.005）
-- slOrdPx = sl_short（限价）
-- reduceOnly = true
-
-## 记录 algoId
-
-OCO 单挂出后，更新 hedge_log.json 当前记录：
-- long.algoId = <多头 OCO algoId>
-- short.algoId = <空头 OCO algoId>
-
-## 持仓监控
-
-OCO 单由交易所自动监控和执行，不需要轮询价格。
-每 10 分钟检查一次（account_get_positions + swap_get_algo_orders）：
-
-1. 两侧持仓都在 + 两个 OCO 都 pending → 正常，继续等待
-2. 一侧持仓已平（pos=0）→ 该侧 OCO 已触发
-   → 更新 hedge_log：该侧 state="tp" 或 "sl"（通过 swap_get_algo_orders history 查询结果）
-   → 更新 status="partial"
-   → 等待另一侧 OCO 触发
-3. 两侧都平（pos=0）→ 两个 OCO 都已触发
-   → 更新 hedge_log：status="closed"，记录 result 和 pnl
-   → 等待 5 秒冷却，回到 Step 1
-4. 持仓在但对应的 OCO 消失（被手动取消等）→ 重新挂 OCO
-
-## 结果与 PnL 记录
-
-根据两侧 state 确定结果：
-- long.state="tp" + short.state="tp" → DOUBLE_TP
-- long.state="tp" + short.state="sl" → LONG_TP_SHORT_SL
-- long.state="sl" + short.state="tp" → SHORT_TP_LONG_SL
-
-PnL 计算：调用 account_get_positions_history 获取已平仓位的 realizedPnl，写入 hedge_log。
-
-# Step 5 · AI 综合判断（核心）
-
-基于以上数据，你作为交易 AI 需要在每轮开仓前判断：
-
-1. 当前 ATR 是否在合理区间？
-   - ATR 过低（< 价格的 0.05%）→ 波动不足，DTP 概率低，跳过本轮
-   - ATR 过高（> 价格的 0.5%）→ 波动过大，SL 风险高，减半仓位（qty ÷ 2）
-   - ATR 正常 → 正常开仓
-
-2. 盘口价差是否合理？
-   - spread = (ask1 - bid1) / mid
-   - spread > 0.05% → 价差过大，开仓成本高，跳过
-   - spread <= 0.05% → 正常开仓
-
-3. 最近 5 轮结果分析：
-   - 连续 5 轮 TPSL（无 DTP）→ 市场可能进入单边行情，暂停 30 分钟
-   - DTP 率 > 40% → 策略运行良好，正常执行
-
-综合以上三点，给出决策：开仓 / 减仓 / 跳过，并说明理由。
+- mgnMode = isolated
+- posSide = long（或 short）
+此命令市价平掉整个仓位，不需要指定张数。
 
 # 风控规则
 
-// 单轮最大亏损约 $4.20（一侧 TP + 一侧 SL）
-// 缓冲资金 $360 不得用于开仓保证金
-// 可用余额低于 $140 时停止开新仓
-// 当日累计亏损超过 $50（账户净值 10%）→ 停止交易至次日
-// 所有下单必须带 tag = "agentTradeKit"
+- 单轮最大亏损约 $4.20（一侧 TP 0.20% + 另一侧 SL 0.50%）
+- 缓冲资金 $360 不得用于开仓保证金
+- 可用余额低于 $140 时停止开新仓
+- 当日累计亏损超过 $50（读 hedge_log 当日 closed 记录汇总）→ 停止交易至次日
+- 网格策略仓位（cross 模式）绝对不碰
+- 审计日志自动记录在 ~/.okx/logs/trade-YYYY-MM-DD.log
